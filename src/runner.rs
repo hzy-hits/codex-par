@@ -39,7 +39,7 @@ impl TaskRunner {
     }
 
     pub async fn run_task(&self, task: TaskDef, cancel: CancellationToken, wave: Option<u32>) -> TaskRunReport {
-        let mut meta = TaskMeta::new(&task.name, &task.cwd, &task.prompt);
+        let mut meta = TaskMeta::new(&task.name, &task.cwd.to_string_lossy(), &task.prompt);
         meta.wave = wave;
         meta.status = TaskStatus::Running;
         if let Err(e) = meta.save(&self.log_dir) {
@@ -90,12 +90,14 @@ impl TaskRunner {
 
         // Build command
         let mut cmd = Command::new(codex_bin());
-        cmd.args(["exec", "-C", &task.cwd, "-s", &task.sandbox]);
+        cmd.args(["exec", "-C"]);
+        cmd.arg(&task.cwd);
+        cmd.args(["-s", &task.sandbox.to_string()]);
         cmd.args([
             "-o",
             result_file
                 .to_str()
-                .context("output file path is not valid UTF-8")?,
+                .ok_or_else(|| anyhow::anyhow!("output file path is not valid UTF-8"))?
         ]);
         cmd.args(["--json", "--skip-git-repo-check"]);
         if let Some(ref model) = task.model {
