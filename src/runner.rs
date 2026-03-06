@@ -1,14 +1,17 @@
 use crate::config::TaskDef;
 use crate::event::CodexEvent;
 use crate::meta::{TaskMeta, TaskStatus};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::Command;
+use tokio::process::{Child, Command};
 use tokio_util::sync::CancellationToken;
 
 /// Every N events, flush meta to disk (balance IO vs realtime).
 const META_UPDATE_INTERVAL: u64 = 20;
+
+/// Time to wait after SIGTERM before escalating to SIGKILL.
+const SIGKILL_TIMEOUT_MS: u64 = 3000;
 
 fn codex_bin() -> String {
     std::env::var("CODEX_BIN").unwrap_or_else(|_| "/opt/homebrew/bin/codex".to_string())
@@ -24,8 +27,10 @@ impl TaskRunner {
     pub fn new(base_dir: &Path) -> Result<Self> {
         let output_dir = base_dir.join("outputs");
         let log_dir = base_dir.join("logs");
-        std::fs::create_dir_all(&output_dir)?;
-        std::fs::create_dir_all(&log_dir)?;
+        std::fs::create_dir_all(&output_dir)
+            .with_context(|| format!("failed to create output dir: {}", output_dir.display()))?;
+        std::fs::create_dir_all(&log_dir)
+            .with_context(|| format!("failed to create log dir: {}", log_dir.display()))?;
         Ok(Self { output_dir, log_dir })
     }
 
@@ -37,11 +42,15 @@ impl TaskRunner {
         let mut meta = TaskMeta::new(&task.name, &task.cwd, &task.prompt);
         meta.wave = wave;
         meta.status = TaskStatus::Running;
-        let _ = meta.save(&self.log_dir);
+        if let Err(e) = meta.save(&self.log_dir) {
+            eprintln!("[{}] warn: failed to write Running meta: {}", task.name, e);
+        }
 
         match self.run_task_inner(&task, &mut meta, &cancel).await {
             Ok(()) => {
-                meta.save(&self.log_dir).ok();
+                if let Err(e) = meta.save(&self.log_dir) {
+                    eprintln!("[{}] warn: failed to write final meta: {}", task.name, e);
+                }
                 TaskRunReport {
                     name: task.name.clone(),
                     status: meta.status.clone(),
@@ -49,7 +58,6 @@ impl TaskRunner {
                 }
             }
             Err(e) => {
-                // Ensure meta is always updated on failure
                 if cancel.is_cancelled() {
                     meta.status = TaskStatus::Cancelled;
                     meta.error = Some("cancelled by user".into());
@@ -58,7 +66,9 @@ impl TaskRunner {
                     meta.error = Some(e.to_string());
                 }
                 meta.end_time = Some(chrono::Local::now());
-                meta.save(&self.log_dir).ok();
+                if let Err(save_err) = meta.save(&self.log_dir) {
+                    eprintln!("[{}] warn: failed to write Failed meta: {}", task.name, save_err);
+                }
                 TaskRunReport {
                     name: task.name.clone(),
                     status: meta.status.clone(),
@@ -81,7 +91,12 @@ impl TaskRunner {
         // Build command
         let mut cmd = Command::new(codex_bin());
         cmd.args(["exec", "-C", &task.cwd, "-s", &task.sandbox]);
-        cmd.args(["-o", result_file.to_str().unwrap()]);
+        cmd.args([
+            "-o",
+            result_file
+                .to_str()
+                .context("output file path is not valid UTF-8")?,
+        ]);
         cmd.args(["--json", "--skip-git-repo-check"]);
         if let Some(ref model) = task.model {
             cmd.args(["-m", model]);
@@ -94,42 +109,62 @@ impl TaskRunner {
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt;
-            unsafe { cmd.pre_exec(|| {
-                libc::setpgid(0, 0);
-                Ok(())
-            }); }
+            unsafe {
+                cmd.pre_exec(|| {
+                    libc::setpgid(0, 0);
+                    Ok(())
+                });
+            }
         }
 
-        let mut child = cmd.spawn()?;
+        let mut child = cmd.spawn().context("failed to spawn codex process")?;
         meta.pid = child.id();
-        meta.save(&self.log_dir)?;
+        meta.save(&self.log_dir)
+            .context("failed to persist pid to meta")?;
 
-        // Drain stderr to file (prevents pipe buffer deadlock)
+        // Drain stderr to file (prevents pipe buffer deadlock).
+        // Truncate on each run so reruns start fresh.
         let stderr = child.stderr.take().expect("stderr captured");
-        let stderr_drain = tokio::spawn(async move {
-            let mut reader = BufReader::new(stderr).lines();
-            let mut writer = tokio::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&stderr_file)
-                .await
-                .ok();
-            while let Ok(Some(line)) = reader.next_line().await {
-                if let Some(ref mut w) = writer {
-                    let _ = w.write_all(line.as_bytes()).await;
-                    let _ = w.write_all(b"\n").await;
+        let stderr_drain = {
+            let stderr_file = stderr_file.clone();
+            tokio::spawn(async move {
+                let mut reader = BufReader::new(stderr).lines();
+                // Truncate (create/truncate) so reruns don't accumulate output
+                let mut writer = match tokio::fs::OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .truncate(true)
+                    .open(&stderr_file)
+                    .await
+                {
+                    Ok(f) => Some(f),
+                    Err(e) => {
+                        eprintln!("warn: could not open stderr log {}: {}", stderr_file.display(), e);
+                        None
+                    }
+                };
+                while let Ok(Some(line)) = reader.next_line().await {
+                    if let Some(ref mut w) = writer {
+                        if w.write_all(line.as_bytes()).await.is_err()
+                            || w.write_all(b"\n").await.is_err()
+                        {
+                            // drain continues even if write fails
+                        }
+                    }
                 }
-            }
-        });
+            })
+        };
 
-        // Stream stdout JSONL
+        // Stream stdout JSONL. Truncate on each run so reruns start fresh.
         let stdout = child.stdout.take().expect("stdout captured");
         let mut reader = BufReader::new(stdout).lines();
         let mut log_writer = tokio::fs::OpenOptions::new()
             .create(true)
-            .append(true)
+            .write(true)
+            .truncate(true)
             .open(&log_file)
-            .await?;
+            .await
+            .with_context(|| format!("failed to open event log: {}", log_file.display()))?;
 
         loop {
             tokio::select! {
@@ -140,28 +175,24 @@ impl TaskRunner {
                 result = reader.next_line() => {
                     match result {
                         Ok(Some(line)) => {
-                            // Always persist raw line first
                             log_writer.write_all(line.as_bytes()).await?;
                             log_writer.write_all(b"\n").await?;
 
                             meta.events_count += 1;
 
-                            // Parse and update stats
                             if let Some(event) = CodexEvent::parse(&line) {
                                 update_meta_from_event(meta, &event);
                             }
 
                             if meta.events_count % META_UPDATE_INTERVAL == 0 {
-                                meta.save(&self.log_dir)?;
+                                if let Err(e) = meta.save(&self.log_dir) {
+                                    eprintln!("[{}] warn: periodic meta save failed: {}", meta.name, e);
+                                }
                             }
 
                             // Check cancel between lines so chatty tasks still respond to Ctrl+C
                             if cancel.is_cancelled() {
-                                #[cfg(unix)]
-                                if let Some(pid) = meta.pid {
-                                    unsafe { libc::kill(-(pid as i32), libc::SIGTERM); }
-                                }
-                                child.kill().await.ok();
+                                kill_and_wait(&mut child, meta.pid).await;
                                 meta.status = TaskStatus::Cancelled;
                                 meta.end_time = Some(chrono::Local::now());
                                 break;
@@ -175,12 +206,7 @@ impl TaskRunner {
                     }
                 }
                 _ = cancel.cancelled() => {
-                    // Kill the entire process group
-                    #[cfg(unix)]
-                    if let Some(pid) = meta.pid {
-                        unsafe { libc::kill(-(pid as i32), libc::SIGTERM); }
-                    }
-                    child.kill().await.ok();
+                    kill_and_wait(&mut child, meta.pid).await;
                     meta.status = TaskStatus::Cancelled;
                     meta.end_time = Some(chrono::Local::now());
                     break;
@@ -188,12 +214,17 @@ impl TaskRunner {
             }
         }
 
-        // Wait for stderr drain to finish
-        stderr_drain.await.ok();
+        // Wait for stderr drain to finish (ignore join error — drain task is best-effort)
+        if let Err(e) = stderr_drain.await {
+            eprintln!("[{}] warn: stderr drain task failed: {}", meta.name, e);
+        }
 
-        // Wait for process exit (if not already killed)
+        // Wait for process exit (if not already killed by cancel path)
         if meta.status != TaskStatus::Cancelled {
-            let exit_status = child.wait().await?;
+            let exit_status = child
+                .wait()
+                .await
+                .context("failed to wait for codex process")?;
             meta.exit_code = exit_status.code();
             meta.end_time = Some(chrono::Local::now());
             // If we already recorded an error (e.g. stdout read failure), keep Failed
@@ -210,6 +241,36 @@ impl TaskRunner {
 
         Ok(())
     }
+}
+
+/// Graceful shutdown: SIGTERM → wait up to SIGKILL_TIMEOUT_MS → SIGKILL → wait.
+/// Always reaps the child even on error paths to prevent zombies.
+async fn kill_and_wait(child: &mut Child, pid: Option<u32>) {
+    #[cfg(unix)]
+    if let Some(pid) = pid {
+        // Send SIGTERM to the entire process group
+        unsafe { libc::kill(-(pid as i32), libc::SIGTERM) };
+    }
+
+    // Give the process a moment to exit cleanly, then SIGKILL
+    let wait_result = tokio::time::timeout(
+        std::time::Duration::from_millis(SIGKILL_TIMEOUT_MS),
+        child.wait(),
+    )
+    .await;
+
+    if wait_result.is_err() {
+        // Timed out — escalate to SIGKILL
+        #[cfg(unix)]
+        if let Some(pid) = pid {
+            unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
+        }
+        // Force kill via tokio handle as fallback
+        child.kill().await.ok();
+        // Final wait to reap zombie
+        child.wait().await.ok();
+    }
+    // If wait_result is Ok (process exited), we're done
 }
 
 fn update_meta_from_event(meta: &mut TaskMeta, event: &CodexEvent) {
