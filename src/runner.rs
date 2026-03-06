@@ -83,7 +83,12 @@ impl TaskRunner {
         cmd.args(["exec", "-C"]);
         cmd.arg(&task.cwd);
         cmd.args(["-s", &task.sandbox.to_string()]);
-        cmd.args(["-o", result_file.to_str().unwrap()]);
+        cmd.args([
+            "-o",
+            result_file
+                .to_str()
+                .ok_or_else(|| anyhow::anyhow!("output file path is not valid UTF-8"))?,
+        ]);
         cmd.args(["--json", "--skip-git-repo-check"]);
         if let Some(ref model) = task.model {
             cmd.args(["-m", model]);

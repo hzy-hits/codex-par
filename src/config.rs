@@ -77,15 +77,21 @@ impl TasksConfig {
             );
         }
 
-        // Validate task names are safe file stems (no path separators, not empty)
+        // Validate task names are safe file stems.
+        // Enforce a conservative charset: [A-Za-z0-9._-] only.
+        // This prevents path separators, control characters, whitespace-only names,
+        // terminal escape injection, and case-insensitive filesystem collisions.
         for task in &self.tasks {
             anyhow::ensure!(
                 !task.name.is_empty(),
                 "task name cannot be empty"
             );
+            let valid = task.name.chars().all(|c| {
+                c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-'
+            });
             anyhow::ensure!(
-                !task.name.contains('/') && !task.name.contains('\\') && !task.name.contains('\0'),
-                "task name '{}' contains invalid characters (/, \\, or null)",
+                valid,
+                "task name '{}' contains invalid characters (only [A-Za-z0-9._-] are allowed)",
                 task.name
             );
             anyhow::ensure!(
@@ -310,6 +316,34 @@ tasks:
     #[test]
     fn path_traversal_name_error() {
         let config = TasksConfig { tasks: vec![task("../evil", vec![])] };
+        let err = config.into_waves().unwrap_err();
+        assert!(err.to_string().contains("invalid characters"));
+    }
+
+    #[test]
+    fn dot_and_dotdot_name_error() {
+        for name in &[".", ".."] {
+            let config = TasksConfig { tasks: vec![task(name, vec![])] };
+            let err = config.into_waves().unwrap_err();
+            assert!(
+                err.to_string().contains("invalid characters") || err.to_string().contains("valid file stem"),
+                "unexpected error for name {:?}: {}",
+                name,
+                err
+            );
+        }
+    }
+
+    #[test]
+    fn control_char_name_error() {
+        let config = TasksConfig { tasks: vec![task("a\nb", vec![])] };
+        let err = config.into_waves().unwrap_err();
+        assert!(err.to_string().contains("invalid characters"));
+    }
+
+    #[test]
+    fn space_in_name_error() {
+        let config = TasksConfig { tasks: vec![task("my task", vec![])] };
         let err = config.into_waves().unwrap_err();
         assert!(err.to_string().contains("invalid characters"));
     }
