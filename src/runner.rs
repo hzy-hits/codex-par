@@ -33,8 +33,9 @@ impl TaskRunner {
         &self.log_dir
     }
 
-    pub async fn run_task(&self, task: TaskDef, cancel: CancellationToken) -> TaskRunReport {
+    pub async fn run_task(&self, task: TaskDef, cancel: CancellationToken, wave: Option<u32>) -> TaskRunReport {
         let mut meta = TaskMeta::new(&task.name, &task.cwd, &task.prompt);
+        meta.wave = wave;
         meta.status = TaskStatus::Running;
         let _ = meta.save(&self.log_dir);
 
@@ -44,7 +45,7 @@ impl TaskRunner {
                 TaskRunReport {
                     name: task.name.clone(),
                     status: meta.status.clone(),
-                    error: None,
+                    error: meta.error.clone(),
                 }
             }
             Err(e) => {
@@ -132,17 +133,10 @@ impl TaskRunner {
 
         loop {
             tokio::select! {
-                _ = cancel.cancelled() => {
-                    // Kill the entire process group
-                    #[cfg(unix)]
-                    if let Some(pid) = meta.pid {
-                        unsafe { libc::kill(-(pid as i32), libc::SIGTERM); }
-                    }
-                    child.kill().await.ok();
-                    meta.status = TaskStatus::Cancelled;
-                    meta.end_time = Some(chrono::Local::now());
-                    break;
-                }
+                // Bias toward stdout: if EOF and cancel are both ready, drain stdout first
+                // so we don't misclassify a completed task as cancelled.
+                biased;
+
                 result = reader.next_line() => {
                     match result {
                         Ok(Some(line)) => {
@@ -160,6 +154,18 @@ impl TaskRunner {
                             if meta.events_count % META_UPDATE_INTERVAL == 0 {
                                 meta.save(&self.log_dir)?;
                             }
+
+                            // Check cancel between lines so chatty tasks still respond to Ctrl+C
+                            if cancel.is_cancelled() {
+                                #[cfg(unix)]
+                                if let Some(pid) = meta.pid {
+                                    unsafe { libc::kill(-(pid as i32), libc::SIGTERM); }
+                                }
+                                child.kill().await.ok();
+                                meta.status = TaskStatus::Cancelled;
+                                meta.end_time = Some(chrono::Local::now());
+                                break;
+                            }
                         }
                         Ok(None) => break, // EOF
                         Err(e) => {
@@ -167,6 +173,17 @@ impl TaskRunner {
                             break;
                         }
                     }
+                }
+                _ = cancel.cancelled() => {
+                    // Kill the entire process group
+                    #[cfg(unix)]
+                    if let Some(pid) = meta.pid {
+                        unsafe { libc::kill(-(pid as i32), libc::SIGTERM); }
+                    }
+                    child.kill().await.ok();
+                    meta.status = TaskStatus::Cancelled;
+                    meta.end_time = Some(chrono::Local::now());
+                    break;
                 }
             }
         }
@@ -179,11 +196,16 @@ impl TaskRunner {
             let exit_status = child.wait().await?;
             meta.exit_code = exit_status.code();
             meta.end_time = Some(chrono::Local::now());
-            meta.status = if exit_status.success() {
-                TaskStatus::Done
+            // If we already recorded an error (e.g. stdout read failure), keep Failed
+            if meta.error.is_some() {
+                meta.status = TaskStatus::Failed;
             } else {
-                TaskStatus::Failed
-            };
+                meta.status = if exit_status.success() {
+                    TaskStatus::Done
+                } else {
+                    TaskStatus::Failed
+                };
+            }
         }
 
         Ok(())

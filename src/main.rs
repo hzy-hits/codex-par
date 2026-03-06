@@ -18,7 +18,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Launch all tasks in parallel
+    /// Launch tasks in dependency waves (parallel within each wave)
     Run {
         /// Path to tasks YAML config
         config: String,
@@ -62,31 +62,25 @@ async fn main() -> anyhow::Result<()> {
             let base = PathBuf::from(&dir);
             let tasks_config = config::TasksConfig::load(&config)?;
 
-            // Validate: no duplicate task names
-            let mut seen = std::collections::HashSet::new();
-            for task in &tasks_config.tasks {
-                anyhow::ensure!(
-                    seen.insert(&task.name),
-                    "duplicate task name: {}",
-                    task.name
-                );
-            }
+            // Topological sort into waves (validates duplicates, deps, cycles)
+            let waves = tasks_config.into_waves()?;
+            let total_tasks: usize = waves.iter().map(|w| w.len()).sum();
 
             let runner = runner::TaskRunner::new(&base)?;
             let shutdown = CancellationToken::new();
             let log_dir = runner.log_dir().to_path_buf();
 
-            println!("Launching {} tasks in parallel...\n", tasks_config.tasks.len());
-
-            // Spawn all tasks
-            let mut set = JoinSet::new();
-            for task in tasks_config.tasks {
-                let runner = runner.clone();
-                let cancel = shutdown.clone();
-                set.spawn(async move {
-                    runner.run_task(task, cancel).await
-                });
+            // Pre-create Pending meta files for all tasks so dashboard shows full pipeline
+            for (wave_idx, wave) in waves.iter().enumerate() {
+                for task in wave {
+                    let mut m = meta::TaskMeta::new(&task.name, &task.cwd, &task.prompt);
+                    m.wave = Some(wave_idx as u32);
+                    m.status = meta::TaskStatus::Pending;
+                    let _ = m.save(&log_dir);
+                }
             }
+
+            println!("Launching {} tasks in {} wave(s)...\n", total_tasks, waves.len());
 
             // Optionally spawn dashboard
             let dashboard_handle = if dashboard {
@@ -99,37 +93,114 @@ async fn main() -> anyhow::Result<()> {
                 None
             };
 
-            // Collect results, handle Ctrl+C
-            let mut reports = Vec::new();
-            let mut interrupted = false;
+            let mut all_reports = Vec::new();
+            let mut wave_failed = false;
+            let mut sigint_received = false;
 
-            loop {
-                tokio::select! {
-                    _ = tokio::signal::ctrl_c(), if !interrupted => {
-                        interrupted = true;
-                        eprintln!("\nReceived Ctrl+C, cancelling all tasks...");
-                        shutdown.cancel();
+            for (wave_idx, wave) in waves.into_iter().enumerate() {
+                if wave_failed || sigint_received {
+                    // Mark remaining tasks as cancelled
+                    let reason = if sigint_received {
+                        "cancelled by user"
+                    } else {
+                        "skipped: previous wave had failures"
+                    };
+                    for task in &wave {
+                        let mut m = meta::TaskMeta::new(&task.name, &task.cwd, &task.prompt);
+                        m.wave = Some(wave_idx as u32);
+                        m.status = meta::TaskStatus::Cancelled;
+                        m.error = Some(reason.into());
+                        m.end_time = Some(chrono::Local::now());
+                        let _ = m.save(&log_dir);
+                        all_reports.push(runner::TaskRunReport {
+                            name: task.name.clone(),
+                            status: meta::TaskStatus::Cancelled,
+                            error: Some(reason.into()),
+                        });
                     }
-                    result = set.join_next() => {
-                        match result {
-                            Some(Ok(report)) => reports.push(report),
-                            Some(Err(e)) => eprintln!("Task panicked: {}", e),
-                            None => break, // All tasks done
+                    continue;
+                }
+
+                let wave_size = wave.len();
+                println!(
+                    "-- Wave {} ({} task{}, parallel) --",
+                    wave_idx,
+                    wave_size,
+                    if wave_size == 1 { "" } else { "s" }
+                );
+
+                // Track spawned task names so we can fix up stale metas after panics
+                let mut wave_task_names: Vec<String> = Vec::new();
+                let mut set = JoinSet::new();
+                for task in wave {
+                    wave_task_names.push(task.name.clone());
+                    let runner = runner.clone();
+                    let cancel = shutdown.clone();
+                    let w = wave_idx as u32;
+                    set.spawn(async move {
+                        runner.run_task(task, cancel, Some(w)).await
+                    });
+                }
+
+                // Collect results for this wave
+                let mut reported_names = std::collections::HashSet::new();
+                loop {
+                    tokio::select! {
+                        _ = tokio::signal::ctrl_c(), if !sigint_received => {
+                            sigint_received = true;
+                            eprintln!("\nReceived Ctrl+C, cancelling all tasks...");
+                            shutdown.cancel();
                         }
+                        result = set.join_next() => {
+                            match result {
+                                Some(Ok(report)) => {
+                                    if report.status == meta::TaskStatus::Failed {
+                                        wave_failed = true;
+                                    }
+                                    reported_names.insert(report.name.clone());
+                                    all_reports.push(report);
+                                }
+                                Some(Err(e)) => {
+                                    eprintln!("Task panicked: {}", e);
+                                    wave_failed = true;
+                                }
+                                None => break, // All tasks in this wave done
+                            }
+                        }
+                    }
+                }
+
+                // Fix up any tasks that panicked (reported via JoinError, no TaskRunReport)
+                for name in &wave_task_names {
+                    if !reported_names.contains(name) {
+                        // Task panicked — update meta on disk to terminal state
+                        let meta_path = log_dir.join(format!("{}.meta.json", name));
+                        if let Ok(mut m) = meta::TaskMeta::load(&meta_path) {
+                            m.status = meta::TaskStatus::Failed;
+                            m.error = Some("task panicked".into());
+                            m.end_time = Some(chrono::Local::now());
+                            let _ = m.save(&log_dir);
+                        }
+                        all_reports.push(runner::TaskRunReport {
+                            name: name.clone(),
+                            status: meta::TaskStatus::Failed,
+                            error: Some("task panicked".into()),
+                        });
                     }
                 }
             }
 
-            // Wait for dashboard to finish
+            // Stop dashboard
             if let Some(handle) = dashboard_handle {
+                shutdown.cancel();
                 handle.await.ok();
             }
 
             // Print summary
-            println!("\n{}", "═".repeat(50));
-            println!("  SUMMARY");
-            println!("{}", "═".repeat(50));
-            for report in &reports {
+            println!("\n{}", "=".repeat(50));
+            println!("  SUMMARY ({} tasks)", total_tasks);
+            println!("{}", "=".repeat(50));
+            for report in &all_reports {
                 let icon = match report.status {
                     meta::TaskStatus::Done => "\x1b[32m✓\x1b[0m",
                     meta::TaskStatus::Failed => "\x1b[31m✗\x1b[0m",
@@ -138,13 +209,13 @@ async fn main() -> anyhow::Result<()> {
                 };
                 print!("  {} {}", icon, report.name);
                 if let Some(ref err) = report.error {
-                    print!("  — {}", err);
+                    print!("  -- {}", err);
                 }
                 println!();
             }
             println!("\n  Results: {}/outputs/*.md", dir);
 
-            let all_ok = reports.iter().all(|r| r.status == meta::TaskStatus::Done);
+            let all_ok = all_reports.iter().all(|r| r.status == meta::TaskStatus::Done);
             if !all_ok {
                 std::process::exit(1);
             }

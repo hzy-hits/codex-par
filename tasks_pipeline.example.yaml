@@ -1,0 +1,33 @@
+# Example: multi-wave pipeline with depends_on
+# Wave 0: Three parallel analysis tasks
+# Wave 1: Cross-review depends on all three
+
+tasks:
+  - name: "codex_fee_calculator"
+    cwd: "/path/to/project"
+    sandbox: "read-only"
+    prompt: |
+      Analyze the fee calculation logic and report findings.
+
+  - name: "codex_retry_job"
+    cwd: "/path/to/project"
+    sandbox: "read-only"
+    prompt: |
+      Analyze the retry job failure recovery paths.
+
+  - name: "codex_bff_judgement"
+    cwd: "/path/to/project"
+    sandbox: "read-only"
+    prompt: |
+      Analyze the business judgement logic.
+
+  - name: "cross_review"
+    depends_on:
+      - "codex_fee_calculator"
+      - "codex_retry_job"
+      - "codex_bff_judgement"
+    cwd: "/path/to/project"
+    sandbox: "read-only"
+    prompt: |
+      Read outputs/ and cross-review all three analysis reports.
+      Find contradictions, systemic risks, and prioritize fixes.

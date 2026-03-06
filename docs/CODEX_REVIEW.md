@@ -19,7 +19,7 @@
 
 | # | Issue | Location | Fix |
 |---|-------|----------|-----|
-| 6 | `tail` reads to EOF then exits, not follow mode | main.rs:95-105 | Rewrote as follow mode: EOF → check meta.status → sleep 200ms → retry |
+| 6 | `tail` reads to EOF then exits, not follow mode | main.rs:95-105 | Rewrote as follow mode: EOF -> check meta.status -> sleep 200ms -> retry |
 | 7 | `create_dir_all().ok()` swallows errors | runner.rs:21-22 | Changed `TaskRunner::new` to return `Result`, propagate errors |
 
 ### Architecture Suggestions (Implemented)
@@ -37,37 +37,45 @@
 - Retry logic: optional, only for infrastructure failures (spawn/IO/transient non-zero exit), not "model answered poorly"
 - Integration tests: fake codex binary, Ctrl+C cancel test, concurrent meta read/write test
 
-### Codex's Recommended `main.rs` Pattern
+---
 
-```rust
-use tokio::task::JoinSet;
-use tokio_util::sync::CancellationToken;
+## Review 2 — v2.0 depends_on + Wave Scheduling (2026-03-06)
 
-let shutdown = CancellationToken::new();
-let mut set = JoinSet::new();
+**Reviewer:** Codex (GPT-5.4, xhigh reasoning)
+**Scope:** Implementation plan review + 3 rounds of code review
+**Tokens used:** ~156K across 3 review rounds
 
-for task in tasks {
-    let runner = runner.clone();
-    let shutdown = shutdown.clone();
-    set.spawn(async move { runner.run_task(task, shutdown).await });
-}
+### Round 1 — Plan Review (pre-implementation)
 
-loop {
-    tokio::select! {
-        _ = tokio::signal::ctrl_c(), if !interrupted => {
-            interrupted = true;
-            shutdown.cancel();
-        }
-        Some(joined) = set.join_next() => {
-            reports.push(joined??);
-        }
-        else => break,
-    }
-}
-```
+| # | Severity | Issue | Fix Applied |
+|---|----------|-------|-------------|
+| 1 | High | `wave` field on TaskMeta not backward-compatible — old meta.json fails to parse | Added `#[serde(default)]` on `wave` field |
+| 2 | High | `interrupted` flag overloaded for Ctrl+C and task failure — blocks further Ctrl+C after first failure | Split into `wave_failed` and `sigint_received` flags |
+| 3 | High | Future-wave tasks invisible to dashboard — totals wrong, watch exits early | Pre-create Pending meta files for all tasks before execution |
+| 4 | Medium | `into_waves()` HashMap breaks YAML ordering within waves | Changed to index-keyed HashMap, sort ready indices by original position |
+| 5 | Medium | `into_waves()` silently drops duplicate names via HashMap | Moved duplicate validation into `into_waves()` itself |
+| 6 | Medium | Test suite missing edge cases: empty list, self-dep, duplicates | Added all missing test cases |
+| 7 | Low | CLI help text still says "Launch all tasks in parallel" | Updated to "Launch tasks in dependency waves" |
 
-This pattern was adopted in our implementation.
+### Round 2 — Code Review (post-implementation)
 
-## Review 2 — Pending
+| # | Severity | Issue | Fix Applied |
+|---|----------|-------|-------------|
+| 1 | High | JoinError (panic) path doesn't update meta on disk — stale Running state | Track wave task names, post-wave fixup writes Failed meta for unreported tasks |
+| 2 | Medium | stdout-read error overwritten by exit code, reported as Done | Check `meta.error` before overwriting status; propagate error in TaskRunReport |
+| 3 | Medium | Ctrl+C races with EOF in select — completed task misclassified as Cancelled | `biased` select prefers stdout over cancel |
+| 4 | Medium | Dashboard alphabetical sort breaks wave-internal YAML order | Removed alphabetical sort |
 
-Second review was attempted but blocked by the MCP deadlock issue documented in `MCP_DEADLOCK_ANALYSIS.md`. To be completed after testing the tool end-to-end.
+### Round 3 — Final Review (post-fixes)
+
+| # | Severity | Issue | Fix Applied |
+|---|----------|-------|-------------|
+| 1 | High | JoinError synthetic report still doesn't write meta to disk | Added post-wave loop: scan for unreported tasks, load and update their meta files |
+| 2 | Medium | Biased select can starve Ctrl+C on chatty stdout | Added inline `cancel.is_cancelled()` check after each stdout line |
+| 3 | Medium | Dashboard relies on `read_dir()` order which is unspecified | Sort metas by `(wave, name)` for deterministic display |
+
+### Final Verification
+
+- 11 unit tests pass (into_waves: no deps, linear chain, diamond, circular, self-dep, unknown dep, duplicates, empty, backward compat, wave-0 order, later-wave order)
+- Release build clean (only pre-existing warnings)
+- Backward compatible: existing YAML without `depends_on` works identically (single wave)

@@ -5,6 +5,8 @@ use std::path::Path;
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct TaskMeta {
     pub name: String,
+    #[serde(default)]
+    pub wave: Option<u32>,
     pub cwd: String,
     pub prompt_preview: String,
     pub status: TaskStatus,
@@ -53,6 +55,7 @@ impl TaskMeta {
     pub fn new(name: &str, cwd: &str, prompt: &str) -> Self {
         Self {
             name: name.to_string(),
+            wave: None,
             cwd: cwd.to_string(),
             prompt_preview: prompt.chars().take(150).collect(),
             status: TaskStatus::Pending,
