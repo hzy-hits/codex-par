@@ -18,7 +18,7 @@ impl std::fmt::Display for Sandbox {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Sandbox::ReadOnly => write!(f, "read-only"),
-            Sandbox::ReadWrite => write!(f, "read-write"),
+            Sandbox::ReadWrite => write!(f, "workspace-write"),
             Sandbox::NetworkReadOnly => write!(f, "network-read-only"),
         }
     }
