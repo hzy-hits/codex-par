@@ -1,7 +1,6 @@
-use crate::{config, dashboard, meta, runner};
-use anyhow::Result;
+use crate::{config, dashboard, execution, meta, runner};
+use anyhow::{Context, Result};
 use std::path::Path;
-use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 /// Execute all tasks from a YAML config in dependency waves.
@@ -30,6 +29,18 @@ pub async fn run_command(config_path: &str, base: &Path, show_dashboard: bool) -
         total_tasks,
         waves.len()
     );
+    for (wave_idx, wave) in waves.iter().enumerate() {
+        let wave_size = wave.len();
+        println!(
+            "-- Wave {} ({} task{}, parallel) --",
+            wave_idx,
+            wave_size,
+            if wave_size == 1 { "" } else { "s" }
+        );
+    }
+    if !waves.is_empty() {
+        println!();
+    }
 
     // Optionally spawn dashboard.
     let dashboard_handle = if show_dashboard {
@@ -42,105 +53,34 @@ pub async fn run_command(config_path: &str, base: &Path, show_dashboard: bool) -
         None
     };
 
-    let mut all_reports: Vec<runner::TaskRunReport> = Vec::new();
-    let mut wave_failed = false;
-    let mut sigint_received = false;
+    let mut run_handle = tokio::spawn({
+        let waves = waves.clone();
+        let task_runner = task_runner.clone();
+        let log_dir = log_dir.clone();
+        let cancel = shutdown.clone();
+        async move { execution::run_waves_quiet(waves, task_runner, &log_dir, cancel).await }
+    });
 
-    for (wave_idx, wave) in waves.into_iter().enumerate() {
-        if wave_failed || sigint_received {
-            // Mark remaining tasks as cancelled without running them.
-            let reason = if sigint_received {
-                "cancelled by user"
-            } else {
-                "skipped: previous wave had failures"
-            };
-            for task in &wave {
-                let mut m =
-                    meta::TaskMeta::new(&task.name, &task.cwd.to_string_lossy(), &task.prompt);
-                m.wave = Some(wave_idx as u32);
-                m.status = meta::TaskStatus::Cancelled;
-                m.error = Some(reason.into());
-                m.end_time = Some(chrono::Local::now());
-                let _ = m.save(&log_dir);
-                all_reports.push(runner::TaskRunReport {
-                    name: task.name.clone(),
-                    status: meta::TaskStatus::Cancelled,
-                    error: Some(reason.into()),
-                });
-            }
-            continue;
+    let all_ok = tokio::select! {
+        result = &mut run_handle => {
+            result.context("wave executor panicked")?
         }
-
-        let wave_size = wave.len();
-        println!(
-            "-- Wave {} ({} task{}, parallel) --",
-            wave_idx,
-            wave_size,
-            if wave_size == 1 { "" } else { "s" }
-        );
-
-        // Track names so we can fix up stale metas after panics.
-        let mut wave_task_names: Vec<String> = Vec::new();
-        let mut set = JoinSet::new();
-        for task in wave {
-            wave_task_names.push(task.name.clone());
-            let r = task_runner.clone();
-            let cancel = shutdown.clone();
-            let w = wave_idx as u32;
-            set.spawn(async move { r.run_task(task, cancel, Some(w)).await });
+        _ = tokio::signal::ctrl_c() => {
+            eprintln!("\nReceived Ctrl+C, cancelling all tasks...");
+            shutdown.cancel();
+            run_handle
+                .await
+                .context("wave executor panicked after cancellation")?
         }
-
-        let mut reported_names = std::collections::HashSet::new();
-        loop {
-            tokio::select! {
-                _ = tokio::signal::ctrl_c(), if !sigint_received => {
-                    sigint_received = true;
-                    eprintln!("\nReceived Ctrl+C, cancelling all tasks...");
-                    shutdown.cancel();
-                }
-                result = set.join_next() => {
-                    match result {
-                        Some(Ok(report)) => {
-                            if report.status == meta::TaskStatus::Failed {
-                                wave_failed = true;
-                            }
-                            reported_names.insert(report.name.clone());
-                            all_reports.push(report);
-                        }
-                        Some(Err(e)) => {
-                            eprintln!("Task panicked: {}", e);
-                            wave_failed = true;
-                        }
-                        None => break,
-                    }
-                }
-            }
-        }
-
-        // Fix up any tasks that panicked (no TaskRunReport written).
-        for name in &wave_task_names {
-            if !reported_names.contains(name) {
-                let meta_path = log_dir.join(format!("{}.meta.json", name));
-                if let Ok(mut m) = meta::TaskMeta::load(&meta_path) {
-                    m.status = meta::TaskStatus::Failed;
-                    m.error = Some("task panicked".into());
-                    m.end_time = Some(chrono::Local::now());
-                    let _ = m.save(&log_dir);
-                }
-                all_reports.push(runner::TaskRunReport {
-                    name: name.clone(),
-                    status: meta::TaskStatus::Failed,
-                    error: Some("task panicked".into()),
-                });
-            }
-        }
-    }
+    };
 
     // Stop dashboard.
     if let Some(handle) = dashboard_handle {
         shutdown.cancel();
         handle.await.ok();
     }
+
+    let all_reports = collect_reports(&waves, &log_dir);
 
     // Print summary.
     println!("\n{}", "=".repeat(50));
@@ -161,8 +101,27 @@ pub async fn run_command(config_path: &str, base: &Path, show_dashboard: bool) -
     }
     println!("\n  Results: {}/outputs/*.md", base.display());
 
-    let all_ok = all_reports
-        .iter()
-        .all(|r| r.status == meta::TaskStatus::Done);
     Ok(all_ok)
+}
+
+fn collect_reports(waves: &[Vec<config::TaskDef>], log_dir: &Path) -> Vec<runner::TaskRunReport> {
+    waves
+        .iter()
+        .flat_map(|wave| wave.iter())
+        .map(|task| {
+            let meta_path = log_dir.join(format!("{}.meta.json", task.name));
+            match meta::TaskMeta::load(&meta_path) {
+                Ok(task_meta) => runner::TaskRunReport {
+                    name: task_meta.name,
+                    status: task_meta.status,
+                    error: task_meta.error,
+                },
+                Err(err) => runner::TaskRunReport {
+                    name: task.name.clone(),
+                    status: meta::TaskStatus::Failed,
+                    error: Some(format!("failed to read task meta: {}", err)),
+                },
+            }
+        })
+        .collect()
 }

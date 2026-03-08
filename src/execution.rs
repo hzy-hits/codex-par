@@ -1,5 +1,5 @@
 /// Quiet execution core: run waves without printing to stdout.
-/// Used by both `run` (via a wrapper that adds printing/signals) and `serve`.
+/// Used by `run`; `serve` now uses `RunCoordinator`.
 use crate::{config::TaskDef, meta, runner::TaskRunner};
 use std::{collections::HashSet, path::Path};
 use tokio::task::JoinSet;

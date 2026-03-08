@@ -1,5 +1,6 @@
 use crate::{
     config::TaskDef,
+    facts::FactsStore,
     meta::{TaskMeta, TaskStatus},
     runner::{TaskRunReport, TaskRunner},
 };
@@ -60,6 +61,7 @@ impl RunCoordinator {
 
     pub async fn run(mut self, initial_tasks: Vec<TaskDef>) -> bool {
         let log_dir = self.run_dir.join("logs");
+        let facts_store = FactsStore::new(&self.run_dir);
         let mut join_set: JoinSet<TaskRunReport> = JoinSet::new();
         let mut pending = VecDeque::new();
         let mut accepted = HashSet::new();
@@ -77,7 +79,13 @@ impl RunCoordinator {
         }
 
         loop {
-            self.spawn_ready_tasks(&mut pending, &mut running, &completed, &mut join_set);
+            self.spawn_ready_tasks(
+                &facts_store,
+                &mut pending,
+                &mut running,
+                &completed,
+                &mut join_set,
+            );
 
             if join_set.is_empty() && pending.is_empty() && (sealed || self.dispatch_rx.is_closed())
             {
@@ -162,6 +170,7 @@ impl RunCoordinator {
 
     fn spawn_ready_tasks(
         &self,
+        facts_store: &FactsStore,
         pending: &mut VecDeque<PendingTask>,
         running: &mut HashSet<String>,
         completed: &HashSet<String>,
@@ -178,11 +187,14 @@ impl RunCoordinator {
             };
 
             if task.is_unblocked(completed) {
+                let mut task = task;
                 let task_name = task.def.name.clone();
                 let runner = self.runner.clone();
                 let cancel = self.cancel.clone();
 
-                // TODO: inject facts preamble from FactsStore here
+                if let Ok(Some(preamble)) = facts_store.build_preamble() {
+                    task.def.prompt = format!("{}\n\n{}", preamble, task.def.prompt);
+                }
                 join_set.spawn(async move { runner.run_task(task.def, cancel, None).await });
                 running.insert(task_name);
             } else {

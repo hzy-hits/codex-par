@@ -88,6 +88,11 @@ All subcommands accept `--dir / -d` to set the base directory for `outputs/` and
 | `cwd` | path | yes | Working directory for the Codex process |
 | `sandbox` | string | no | `read-only` (default), `read-write`, `network-read-only` |
 | `model` | string | no | Override the Codex model for this task |
+| `ask_for_approval` | string | no | Approval policy passed to Codex: `never` (default), `on-request`, `untrusted` |
+| `config_overrides` | list | no | `key=value` pairs passed through as `-c` flags to Codex |
+| `profile` | string | no | Codex profile name passed as `-p` |
+| `agent_id` | string | no | Agent identity label for the task (default: task `name`) |
+| `thread_id` | string | no | Thread identity label for routing (default: task `name`) |
 | `depends_on` | list | no | Task names this task waits for |
 
 Validation runs before any tasks start: duplicate names, unknown dependencies, cycles, and invalid characters are all rejected upfront.
@@ -134,7 +139,7 @@ Ctrl+C cancels all running tasks and skips remaining waves.
 
 ## MCP Server (`serve`)
 
-`codex-par serve` exposes five tools over stdio JSON-RPC so Claude can dispatch runs without blocking:
+`codex-par serve` exposes ten tools over stdio JSON-RPC so Claude can dispatch and extend runs without blocking:
 
 | Tool | Description |
 |------|-------------|
@@ -143,8 +148,21 @@ Ctrl+C cancels all running tasks and skips remaining waves.
 | `read_output` | Read a task's markdown output (chunked, with offset) |
 | `read_stderr` | Read a task's stderr log (chunked, with offset) |
 | `cancel_run` | Cancel an active run |
+| `dispatch_task` | Add a single task to an active run at runtime. `depends_on` may only reference already-accepted tasks. Returns immediately. |
+| `dispatch_wave` | Add a batch of tasks atomically. Intra-batch `depends_on` forward refs allowed. |
+| `seal_dispatch` | Close the dispatch channel; the run finalizes when all in-flight tasks finish. Required to end a dynamic run. |
+| `write_fact` | Write a shared fact (key/value) for the run. Auto-prepended to subsequently spawned worker prompts. Values larger than 1 KiB are truncated. |
+| `read_facts` | Read all shared facts for a run from `shared/facts.json`. |
 
-`start_run` returns before tasks complete — Claude polls `get_status` and reads output once tasks are done. This avoids the MCP deadlock entirely.
+`start_run` returns before tasks complete. Static runs can stop there; dynamic runs stay open until `seal_dispatch`. Claude polls `get_status` and reads output once tasks are done.
+
+### Dynamic Scheduling
+
+Use dynamic runs in this order:
+
+```text
+start_run -> [write_fact]* -> [dispatch_task / dispatch_wave]* -> seal_dispatch -> get_status (poll) -> done
+```
 
 ### MCP Configuration (Claude Desktop / claude_desktop_config.json)
 
