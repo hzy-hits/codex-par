@@ -580,12 +580,42 @@ impl McpServer {
     }
 
     fn seal_dispatch(&mut self, run_dir: &Path) {
-        let _: Value = self.call_tool_ok(
+        let response = self.call_tool_raw(
             "seal_dispatch",
             json!({
                 "run_dir": run_dir_string(run_dir),
             }),
             REQUEST_TIMEOUT,
+        );
+
+        if let Some(error) = response.get("error") {
+            let message = error
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if message.contains("has no active run") || message.contains("already terminal") {
+                // Racy but acceptable: run can auto-seal/finish between status poll and seal call.
+                return;
+            }
+            panic!(
+                "seal_dispatch returned unexpected JSON-RPC error: {}
+stderr:
+{}",
+                error,
+                self.stderr_dump()
+            );
+        }
+
+        let result = response
+            .get("result")
+            .unwrap_or_else(|| panic!("seal_dispatch response missing result: {}", response));
+        assert!(
+            !tool_result_is_error(result),
+            "seal_dispatch returned tool error: {}
+stderr:
+{}",
+            tool_result_message(result),
+            self.stderr_dump()
         );
     }
 }
