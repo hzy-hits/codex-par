@@ -42,6 +42,16 @@ pub struct TaskMeta {
     pub name: String,
     #[serde(default)]
     pub wave: Option<u32>,
+    #[serde(default)]
+    pub agent_id: String,
+    #[serde(default)]
+    pub run_id: String,
+    #[serde(default)]
+    pub thread_id: String,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub dispatched_at: Option<chrono::DateTime<chrono::Local>>,
     pub cwd: String,
     pub prompt_preview: String,
     pub status: TaskStatus,
@@ -70,7 +80,10 @@ pub enum TaskStatus {
 
 impl TaskStatus {
     pub fn is_terminal(&self) -> bool {
-        matches!(self, TaskStatus::Done | TaskStatus::Failed | TaskStatus::Cancelled)
+        matches!(
+            self,
+            TaskStatus::Done | TaskStatus::Failed | TaskStatus::Cancelled
+        )
     }
 }
 
@@ -91,6 +104,11 @@ impl TaskMeta {
         Self {
             name: name.to_string(),
             wave: None,
+            agent_id: String::new(),
+            run_id: String::new(),
+            thread_id: String::new(),
+            session_id: None,
+            dispatched_at: None,
             cwd: cwd.to_string(),
             prompt_preview: prompt.chars().take(150).collect(),
             status: TaskStatus::Pending,
@@ -130,5 +148,31 @@ impl TaskMeta {
         self.error = Some(error);
         self.end_time = Some(Local::now());
         let _ = self.save(dir);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TaskMeta;
+
+    #[test]
+    fn taskmeta_dispatched_at_round_trips() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut m = TaskMeta::new("t", "/tmp", "p");
+        m.dispatched_at = Some(chrono::Local::now());
+        m.save(dir.path()).unwrap();
+        let path = dir.path().join("t.meta.json");
+        let loaded = TaskMeta::load(&path).unwrap();
+        assert!(loaded.dispatched_at.is_some());
+    }
+
+    #[test]
+    fn taskmeta_dispatched_at_defaults_none() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let m = TaskMeta::new("t", "/tmp", "p");
+        m.save(dir.path()).unwrap();
+        let path = dir.path().join("t.meta.json");
+        let loaded = TaskMeta::load(&path).unwrap();
+        assert!(loaded.dispatched_at.is_none());
     }
 }

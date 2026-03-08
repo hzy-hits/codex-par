@@ -242,10 +242,18 @@ impl McpServer {
                     }
                 }
                 Ok(StdoutEvent::InvalidJson(err)) => {
-                    panic!("server wrote stray stdout: {}\nstderr:\n{}", err, self.stderr_dump());
+                    panic!(
+                        "server wrote stray stdout: {}\nstderr:\n{}",
+                        err,
+                        self.stderr_dump()
+                    );
                 }
                 Ok(StdoutEvent::ReadError(err)) => {
-                    panic!("failed reading server stdout: {}\nstderr:\n{}", err, self.stderr_dump());
+                    panic!(
+                        "failed reading server stdout: {}\nstderr:\n{}",
+                        err,
+                        self.stderr_dump()
+                    );
                 }
                 Err(RecvTimeoutError::Timeout) => {
                     panic!(
@@ -519,6 +527,16 @@ impl McpServer {
             REQUEST_TIMEOUT,
         )
     }
+
+    fn seal_dispatch(&mut self, run_dir: &Path) {
+        let _: Value = self.call_tool_ok(
+            "seal_dispatch",
+            json!({
+                "run_dir": run_dir_string(run_dir),
+            }),
+            REQUEST_TIMEOUT,
+        );
+    }
 }
 
 impl Drop for McpServer {
@@ -620,7 +638,9 @@ fn run_dir_string(path: &Path) -> String {
 
 #[allow(dead_code)]
 fn load_task_meta(run_dir: &Path, task_name: &str) -> Value {
-    let path = run_dir.join("logs").join(format!("{}.meta.json", task_name));
+    let path = run_dir
+        .join("logs")
+        .join(format!("{}.meta.json", task_name));
     let content = fs::read_to_string(&path).unwrap_or_else(|_| {
         panic!(
             "task meta not found for '{}' at {}",
@@ -633,7 +653,10 @@ fn load_task_meta(run_dir: &Path, task_name: &str) -> Value {
 
 #[allow(dead_code)]
 fn load_run_meta(run_dir: &Path) -> Value {
-    let candidates = [run_dir.join("run.meta.json"), run_dir.join("logs").join("run.meta.json")];
+    let candidates = [
+        run_dir.join("run.meta.json"),
+        run_dir.join("logs").join("run.meta.json"),
+    ];
 
     for path in candidates {
         if path.exists() {
@@ -643,25 +666,26 @@ fn load_run_meta(run_dir: &Path) -> Value {
         }
     }
 
-    panic!(
-        "run.meta.json not found under {}",
-        run_dir.display()
-    );
+    panic!("run.meta.json not found under {}", run_dir.display());
 }
 
 #[allow(dead_code)]
 fn task<'a>(status: &'a StatusResult, name: &str) -> &'a TaskStatusRow {
-    status.tasks.iter().find(|t| t.name == name).unwrap_or_else(|| {
-        panic!(
-            "task '{}' not found in status payload with tasks {:?}",
-            name,
-            status
-                .tasks
-                .iter()
-                .map(|t| t.name.as_str())
-                .collect::<Vec<_>>()
-        )
-    })
+    status
+        .tasks
+        .iter()
+        .find(|t| t.name == name)
+        .unwrap_or_else(|| {
+            panic!(
+                "task '{}' not found in status payload with tasks {:?}",
+                name,
+                status
+                    .tasks
+                    .iter()
+                    .map(|t| t.name.as_str())
+                    .collect::<Vec<_>>()
+            )
+        })
 }
 
 #[allow(dead_code)]
@@ -706,9 +730,39 @@ fn wait_for_run_to_stop(
     poll_interval_ms: u64,
     timeout: Duration,
 ) -> StatusResult {
-    wait_for_status(server, run_dir, poll_interval_ms, timeout, |status| {
-        status.run_status != "running"
-    })
+    let started = Instant::now();
+    let sleep_for = Duration::from_millis(poll_interval_ms.clamp(10, 100));
+    let mut seal_requested = false;
+
+    let mut last = server.get_status(run_dir);
+    loop {
+        if last.run_status != "running" {
+            return last;
+        }
+
+        let all_terminal =
+            !last.tasks.is_empty() && last.tasks.iter().all(|task| is_terminal(&task.status));
+        if all_terminal && !seal_requested {
+            server.seal_dispatch(run_dir);
+            seal_requested = true;
+        }
+
+        if started.elapsed() >= timeout {
+            panic!(
+                "timed out waiting for status on {}. last status: {:?}\nstderr:\n{}",
+                run_dir.display(),
+                last,
+                server.stderr_dump()
+            );
+        }
+
+        std::thread::sleep(sleep_for);
+        last = server.get_status(run_dir);
+    }
+}
+
+fn is_terminal(status: &str) -> bool {
+    matches!(status, "done" | "failed" | "cancelled")
 }
 
 // ---------------------------------------------------------------------------
@@ -724,10 +778,19 @@ fn initialize_and_tools_list_return_expected_tool_names() {
     let names: BTreeSet<_> = server.tools_list().into_iter().collect();
     let expected: BTreeSet<_> = [
         "cancel_run",
+        "dispatch_task",
+        "dispatch_wave",
+        "get_session_id",
         "get_status",
+        "list_mailbox",
+        "read_facts",
         "read_output",
         "read_stderr",
+        "resume_agent",
+        "seal_dispatch",
+        "send_message",
         "start_run",
+        "write_fact",
     ]
     .into_iter()
     .map(str::to_string)
@@ -790,15 +853,22 @@ tasks:
 
     let status = server.get_status(&run_dir);
     assert_eq!(status.run_status, "running");
-    assert!(matches!(task(&status, "slow").status.as_str(), "pending" | "running"));
+    assert!(matches!(
+        task(&status, "slow").status.as_str(),
+        "pending" | "running"
+    ));
     assert!(
         elapsed < Duration::from_millis(500),
         "start_run blocked too long: {:?}",
         elapsed
     );
 
-    let terminal =
-        wait_for_run_to_stop(&mut server, &run_dir, started.poll_interval_ms, SLOW_RUN_TIMEOUT);
+    let terminal = wait_for_run_to_stop(
+        &mut server,
+        &run_dir,
+        started.poll_interval_ms,
+        SLOW_RUN_TIMEOUT,
+    );
     assert_eq!(terminal.run_status, "done");
     assert_eq!(task(&terminal, "slow").status, "done");
 }
@@ -884,8 +954,14 @@ tasks:
         SLOW_RUN_TIMEOUT,
         |status| {
             status.run_status == "running"
-                && status.tasks.iter().any(|t| t.name == "root" && t.status == "running")
-                && status.tasks.iter().any(|t| t.name == "child" && t.status == "pending")
+                && status
+                    .tasks
+                    .iter()
+                    .any(|t| t.name == "root" && t.status == "running")
+                && status
+                    .tasks
+                    .iter()
+                    .any(|t| t.name == "child" && t.status == "pending")
         },
     );
 
@@ -1003,9 +1079,12 @@ tasks:
     assert_eq!(task(&terminal, "big").status, "done");
     assert!(task(&terminal, "big").has_output);
 
-    let expected = fs::read(run_dir.join("outputs").join("big.md"))
-        .expect("expected large output file");
-    assert!(expected.len() > 256, "fixture output should be meaningfully large");
+    let expected =
+        fs::read(run_dir.join("outputs").join("big.md")).expect("expected large output file");
+    assert!(
+        expected.len() > 256,
+        "fixture output should be meaningfully large"
+    );
 
     let first = server.read_output(&run_dir, "big", Some(0), Some(128));
     assert!(first.content.len() <= 128);
@@ -1090,7 +1169,10 @@ tasks:
         SLOW_RUN_TIMEOUT,
         |status| {
             status.run_status == "running"
-                && status.tasks.iter().any(|t| t.status == "running" || t.status == "pending")
+                && status
+                    .tasks
+                    .iter()
+                    .any(|t| t.status == "running" || t.status == "pending")
         },
     );
 
@@ -1140,7 +1222,9 @@ tasks:
         &run_dir,
         started.poll_interval_ms,
         SLOW_RUN_TIMEOUT,
-        |status| status.run_status == "running" && status.tasks.iter().any(|t| t.status == "running"),
+        |status| {
+            status.run_status == "running" && status.tasks.iter().any(|t| t.status == "running")
+        },
     );
 
     let message = server.call_tool_rejection_message(
