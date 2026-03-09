@@ -5,12 +5,12 @@ use serde::Deserialize;
 pub enum Sandbox {
     ReadOnly,
     ReadWrite,
-    NetworkReadOnly,
+    DangerFullAccess,
 }
 
 impl Default for Sandbox {
     fn default() -> Self {
-        Sandbox::ReadOnly
+        Sandbox::ReadWrite
     }
 }
 
@@ -19,7 +19,7 @@ impl std::fmt::Display for Sandbox {
         match self {
             Sandbox::ReadOnly => write!(f, "read-only"),
             Sandbox::ReadWrite => write!(f, "workspace-write"),
-            Sandbox::NetworkReadOnly => write!(f, "network-read-only"),
+            Sandbox::DangerFullAccess => write!(f, "danger-full-access"),
         }
     }
 }
@@ -29,11 +29,21 @@ pub struct TasksConfig {
     pub tasks: Vec<TaskDef>,
 }
 
+#[derive(Debug, Deserialize, Clone, PartialEq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum TaskKind {
+    #[default]
+    Exec,
+    Review,
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct TaskDef {
     pub name: String,
     pub cwd: std::path::PathBuf,
     pub prompt: String,
+    #[serde(default)]
+    pub kind: TaskKind,
     #[serde(default)]
     pub sandbox: Sandbox,
     #[serde(default)]
@@ -46,8 +56,11 @@ pub struct TaskDef {
     pub ephemeral: bool,
     #[serde(default)]
     pub add_dirs: Vec<std::path::PathBuf>,
-    #[serde(default = "default_ask_for_approval")]
-    pub ask_for_approval: String,
+    #[serde(default = "default_full_auto")]
+    pub full_auto: bool,
+    /// Deprecated: use `full_auto` instead. Caught at validation to prevent silent behavior change.
+    #[serde(default)]
+    pub ask_for_approval: Option<String>,
     #[serde(default)]
     pub config_overrides: Vec<String>,
     #[serde(default)]
@@ -55,10 +68,33 @@ pub struct TaskDef {
     pub model: Option<String>,
     #[serde(default)]
     pub depends_on: Vec<String>,
+    // -- review-specific fields (kind: review) --
+    /// Review uncommitted changes (staged + unstaged + untracked)
+    #[serde(default)]
+    pub uncommitted: bool,
+    /// Review changes against this base branch
+    #[serde(default)]
+    pub base: Option<String>,
+    /// Review changes introduced by this commit SHA
+    #[serde(default)]
+    pub commit: Option<String>,
+    /// Optional title shown in the review summary
+    #[serde(default)]
+    pub review_title: Option<String>,
+    // -- new codex CLI flags --
+    /// Image file paths to attach to the initial prompt
+    #[serde(default)]
+    pub images: Vec<std::path::PathBuf>,
+    /// Codex features to enable (passed as --enable)
+    #[serde(default)]
+    pub enable_features: Vec<String>,
+    /// Codex features to disable (passed as --disable)
+    #[serde(default)]
+    pub disable_features: Vec<String>,
 }
 
-fn default_ask_for_approval() -> String {
-    "never".to_string()
+fn default_full_auto() -> bool {
+    true
 }
 
 impl TasksConfig {
@@ -71,10 +107,44 @@ impl TasksConfig {
         let config: TasksConfig = serde_yaml::from_str(content)?;
         for task in &config.tasks {
             anyhow::ensure!(
+                task.ask_for_approval.is_none(),
+                "task '{}': `ask_for_approval` has been removed. Use `full_auto: true` (was 'never'/'auto-edit') \
+                 or `full_auto: false` (was 'on-request'/'untrusted') instead",
+                task.name
+            );
+            anyhow::ensure!(
                 !task.cwd.as_os_str().is_empty(),
                 "task '{}' has empty cwd",
                 task.name
             );
+            anyhow::ensure!(
+                !(task.full_auto && task.sandbox == Sandbox::ReadOnly),
+                "task '{}': full_auto is incompatible with sandbox: read-only \
+                 (--full-auto forces workspace-write). Set sandbox: read-write or full_auto: false",
+                task.name
+            );
+            // Review-specific fields are only valid with kind: review
+            if task.kind != TaskKind::Review {
+                anyhow::ensure!(
+                    !task.uncommitted && task.base.is_none() && task.commit.is_none() && task.review_title.is_none(),
+                    "task '{}': uncommitted/base/commit/review_title fields require kind: review",
+                    task.name
+                );
+            }
+            // Review tasks with scope flags (--uncommitted/--base/--commit) cannot
+            // also pass a custom prompt — the Codex CLI treats them as conflicting
+            // positional arguments. Reject at validation time rather than silently
+            // dropping the prompt at runtime.
+            if task.kind == TaskKind::Review {
+                let has_scope = task.uncommitted || task.base.is_some() || task.commit.is_some();
+                anyhow::ensure!(
+                    !(has_scope && !task.prompt.trim().is_empty()),
+                    "task '{}': review tasks with uncommitted/base/commit cannot also have a prompt \
+                     (Codex CLI limitation). Use review_title instead, or omit the scope flags to \
+                     pass a freeform prompt.",
+                    task.name
+                );
+            }
         }
         Ok(config)
     }
@@ -183,17 +253,26 @@ mod tests {
             name: name.to_string(),
             cwd: std::path::PathBuf::from("/tmp"),
             prompt: "test".to_string(),
-            sandbox: Sandbox::default(),
+            kind: TaskKind::default(),
+            sandbox: Sandbox::ReadWrite,
             agent_id: None,
             thread_id: None,
             output_schema: None,
             ephemeral: false,
             add_dirs: Vec::new(),
-            ask_for_approval: "never".to_string(),
+            full_auto: true,
             config_overrides: Vec::new(),
             profile: None,
             model: None,
             depends_on: depends_on.into_iter().map(String::from).collect(),
+            uncommitted: false,
+            base: None,
+            commit: None,
+            review_title: None,
+            images: Vec::new(),
+            enable_features: Vec::new(),
+            disable_features: Vec::new(),
+            ask_for_approval: None,
         }
     }
 
@@ -399,7 +478,7 @@ tasks:
     }
 
     #[test]
-    fn sandbox_defaults_to_read_only() {
+    fn sandbox_defaults_to_read_write() {
         let yaml = r#"
 tasks:
   - name: "x"
@@ -407,6 +486,48 @@ tasks:
     prompt: "hello"
 "#;
         let config: TasksConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.tasks[0].sandbox, Sandbox::ReadWrite);
+    }
+
+    #[test]
+    fn full_auto_with_read_only_sandbox_rejected() {
+        let yaml = r#"
+tasks:
+  - name: "x"
+    cwd: "/tmp"
+    prompt: "hello"
+    sandbox: "read-only"
+    full_auto: true
+"#;
+        let err = TasksConfig::from_str(yaml).unwrap_err();
+        assert!(err.to_string().contains("full_auto is incompatible with sandbox: read-only"));
+    }
+
+    #[test]
+    fn full_auto_false_with_read_only_sandbox_ok() {
+        let yaml = r#"
+tasks:
+  - name: "x"
+    cwd: "/tmp"
+    prompt: "hello"
+    sandbox: "read-only"
+    full_auto: false
+"#;
+        let config = TasksConfig::from_str(yaml).unwrap();
         assert_eq!(config.tasks[0].sandbox, Sandbox::ReadOnly);
+        assert!(!config.tasks[0].full_auto);
+    }
+
+    #[test]
+    fn danger_full_access_sandbox_deserializes() {
+        let yaml = r#"
+tasks:
+  - name: "x"
+    cwd: "/tmp"
+    prompt: "hello"
+    sandbox: "danger-full-access"
+"#;
+        let config: TasksConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.tasks[0].sandbox, Sandbox::DangerFullAccess);
     }
 }

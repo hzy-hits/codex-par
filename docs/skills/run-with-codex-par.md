@@ -39,9 +39,14 @@ tasks:
 **Rules:**
 - `name`: `[A-Za-z0-9._-]` only — becomes the output filename
 - `cwd`: absolute path where codex runs
-- `sandbox`: `read-only` (default), `read-write`, or `network-read-only`
+- `kind`: `exec` (default) or `review` (uses `codex exec review`)
+- `sandbox`: `read-write` (default), `read-only`, `danger-full-access`
+- `full_auto`: `true` (default) — enables auto-approval (implies workspace-write). Incompatible with `sandbox: read-only`.
 - `model`: optional, e.g. `o3` or `gpt-4o`
 - `depends_on`: tasks in the same wave run parallel; dependent tasks wait
+- `images`: list of image file paths to attach (exec only)
+- `enable_features` / `disable_features`: toggle Codex feature flags
+- Review-only fields: `uncommitted`, `base`, `commit`, `review_title`
 
 ## Step 2 — Run
 
@@ -133,6 +138,20 @@ tasks:
     prompt: "Review the implementation in src/... for correctness"
     depends_on: [implement]
 ```
+
+**Native code review (kind: review):**
+```yaml
+tasks:
+  - name: review-uncommitted
+    cwd: /repo
+    kind: review
+    uncommitted: true
+    full_auto: false
+    sandbox: read-only
+    review_title: "Pre-commit review"
+    prompt: ""
+```
+Note: review tasks with scope flags (`uncommitted`/`base`/`commit`) cannot also have a prompt (Codex CLI limitation). Use `review_title` for context.
 
 **When Codex is slow:**
 - Normal: 1–3 min per task (API latency + reasoning)

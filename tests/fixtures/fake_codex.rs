@@ -29,7 +29,7 @@ fn main() {
                     output_path = Some(args[i].clone());
                 }
             }
-            "exec" | "--json" | "--skip-git-repo-check" => {}
+            "exec" | "--json" | "--skip-git-repo-check" | "--full-auto" => {}
             "-C" | "-s" | "-m" => {
                 i += 1;
             }

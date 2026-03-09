@@ -86,14 +86,22 @@ All subcommands accept `--dir / -d` to set the base directory for `outputs/` and
 | `name` | string | yes | `[A-Za-z0-9._-]` only; no spaces, slashes, or control chars |
 | `prompt` | string | yes | Passed to `codex exec` as the task prompt |
 | `cwd` | path | yes | Working directory for the Codex process |
-| `sandbox` | string | no | `read-only` (default), `read-write`, `network-read-only` |
+| `kind` | string | no | `exec` (default) or `review` (uses `codex exec review`) |
+| `sandbox` | string | no | `read-write` (default), `read-only`, `danger-full-access` |
 | `model` | string | no | Override the Codex model for this task |
-| `ask_for_approval` | string | no | Approval policy passed to Codex: `never` (default), `on-request`, `untrusted` |
+| `full_auto` | bool | no | Enable auto-approval; implies workspace-write sandbox (default: `true`). Incompatible with `sandbox: read-only`. |
 | `config_overrides` | list | no | `key=value` pairs passed through as `-c` flags to Codex |
 | `profile` | string | no | Codex profile name passed as `-p` |
+| `images` | list | no | Image file paths to attach to the prompt (`-i` flag) |
+| `enable_features` | list | no | Codex features to enable (`--enable` flag) |
+| `disable_features` | list | no | Codex features to disable (`--disable` flag) |
 | `agent_id` | string | no | Agent identity label for the task (default: task `name`) |
 | `thread_id` | string | no | Thread identity label for routing (default: task `name`) |
 | `depends_on` | list | no | Task names this task waits for |
+| `uncommitted` | bool | no | Review uncommitted changes (`kind: review` only) |
+| `base` | string | no | Review changes against this branch (`kind: review` only) |
+| `commit` | string | no | Review a specific commit SHA (`kind: review` only) |
+| `review_title` | string | no | Title for the review summary (`kind: review` only) |
 
 Validation runs before any tasks start: duplicate names, unknown dependencies, cycles, and invalid characters are all rejected upfront.
 

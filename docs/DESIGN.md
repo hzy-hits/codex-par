@@ -73,6 +73,10 @@ codex-par run tasks.yaml --dashboard
 | Meta update frequency | Every 20 events | Balances disk IO cost vs dashboard realtime visibility |
 | Execution order | Index-keyed Kahn's algorithm | Tasks within each wave execute in YAML input order |
 | Display order | Dashboard sorts by `(wave, name)` | Deterministic display across platforms; display may differ from YAML order |
+| `--full-auto` handling | Only pass `-s` when not using `--full-auto` | `--full-auto` implies `workspace-write`; passing both `-s read-only --full-auto` silently widens permissions |
+| Sandbox default | `read-write` (not `read-only`) | Matches the actual behavior when `--full-auto` is enabled (the common case) |
+| Review task kind | `codex exec review` subcommand | Native code review with `--uncommitted`/`--base`/`--commit`; uses `current_dir` instead of `-C` |
+| Review output path | Canonicalized before `current_dir()` | Prevents `-o` resolving from `task.cwd` instead of the run directory |
 
 ## File Structure
 
@@ -137,9 +141,22 @@ tasks:
 | `name` | string | yes | Must match `[A-Za-z0-9._-]`; no spaces, slashes, or control characters |
 | `prompt` | string | yes | Passed to `codex exec` as the task prompt |
 | `cwd` | path | yes | Working directory for the Codex process |
-| `sandbox` | string | no | `read-only` (default), `read-write`, or `network-read-only` |
+| `kind` | string | no | `exec` (default) or `review` (uses `codex exec review`) |
+| `sandbox` | string | no | `read-write` (default), `read-only`, `danger-full-access` |
 | `model` | string | no | Override Codex model for this task |
+| `full_auto` | bool | no | Enable auto-approval; implies workspace-write sandbox (default: `true`). Incompatible with `sandbox: read-only`. |
+| `config_overrides` | list | no | `key=value` pairs passed through as `-c` flags to Codex |
+| `profile` | string | no | Codex profile name passed as `-p` |
+| `images` | list | no | Image file paths to attach to the prompt (`-i` flag, exec only) |
+| `enable_features` | list | no | Codex features to enable (`--enable` flag) |
+| `disable_features` | list | no | Codex features to disable (`--disable` flag) |
+| `agent_id` | string | no | Agent identity label for the task (default: task `name`) |
+| `thread_id` | string | no | Thread identity label for routing (default: task `name`) |
 | `depends_on` | list | no | Task names this task must wait for; must all be known names |
+| `uncommitted` | bool | no | Review uncommitted changes (`kind: review` only) |
+| `base` | string | no | Review changes against this branch (`kind: review` only) |
+| `commit` | string | no | Review a specific commit SHA (`kind: review` only) |
+| `review_title` | string | no | Title for the review summary (`kind: review` only) |
 
 Validation errors are caught before any tasks start:
 - Duplicate task names are rejected
@@ -147,6 +164,10 @@ Validation errors are caught before any tasks start:
 - Circular dependencies are detected
 - Task names with invalid characters are rejected (`.` and `..` are also explicitly rejected)
 - Empty `cwd` is rejected
+- `full_auto: true` with `sandbox: read-only` is rejected (incompatible: `--full-auto` forces workspace-write)
+- Review-specific fields (`uncommitted`, `base`, `commit`, `review_title`) require `kind: review`
+- Review tasks with scope flags (`uncommitted`/`base`/`commit`) cannot also have a `prompt` (Codex CLI limitation)
+- Legacy `ask_for_approval` field is rejected with migration instructions
 
 ### Commands
 

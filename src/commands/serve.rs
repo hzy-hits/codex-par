@@ -115,7 +115,10 @@ struct DispatchTaskParams {
     cwd: String,
     /// Prompt passed to the task
     prompt: String,
-    /// Sandbox mode: read-only, read-write, or network-read-only
+    /// Task kind: exec (default) or review
+    #[serde(default)]
+    kind: Option<String>,
+    /// Sandbox mode: read-only, read-write, or danger-full-access
     #[serde(default)]
     sandbox: Option<String>,
     /// Model override for the task
@@ -130,15 +133,45 @@ struct DispatchTaskParams {
     /// Conversation thread identifier recorded in task metadata
     #[serde(default)]
     thread_id: Option<String>,
-    /// Approval policy passed through to Codex
+    /// Enable auto-approval (implies workspace-write sandbox). Default: true.
     #[serde(default)]
-    ask_for_approval: Option<String>,
+    full_auto: Option<bool>,
     /// Repeated config overrides passed through to Codex
     #[serde(default)]
     config_overrides: Vec<String>,
     /// Profile override for the task
     #[serde(default)]
     profile: Option<String>,
+    /// Path to a JSON schema for output validation
+    #[serde(default)]
+    output_schema: Option<String>,
+    /// Run without persisting session files
+    #[serde(default)]
+    ephemeral: Option<bool>,
+    /// Additional writable directories
+    #[serde(default)]
+    add_dirs: Vec<String>,
+    /// Review uncommitted changes (kind: review only)
+    #[serde(default)]
+    uncommitted: Option<bool>,
+    /// Review changes against this base branch (kind: review only)
+    #[serde(default)]
+    base: Option<String>,
+    /// Review a specific commit SHA (kind: review only)
+    #[serde(default)]
+    commit: Option<String>,
+    /// Title for the review summary (kind: review only)
+    #[serde(default)]
+    review_title: Option<String>,
+    /// Image file paths to attach to the prompt
+    #[serde(default)]
+    images: Vec<String>,
+    /// Codex features to enable
+    #[serde(default)]
+    enable_features: Vec<String>,
+    /// Codex features to disable
+    #[serde(default)]
+    disable_features: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -978,50 +1011,86 @@ fn dispatch_validation_placeholder(name: String) -> crate::config::TaskDef {
         name,
         cwd: PathBuf::from("."),
         prompt: String::new(),
+        kind: crate::config::TaskKind::default(),
         sandbox: crate::config::Sandbox::ReadOnly,
         agent_id: None,
         thread_id: None,
         output_schema: None,
         ephemeral: false,
         add_dirs: vec![],
-        ask_for_approval: "never".to_string(),
+        full_auto: true,
         config_overrides: vec![],
         profile: None,
         model: None,
         depends_on: vec![],
+        uncommitted: false,
+        base: None,
+        commit: None,
+        review_title: None,
+        images: vec![],
+        enable_features: vec![],
+        disable_features: vec![],
+        ask_for_approval: None,
     }
 }
 
 fn params_to_task_def(p: DispatchTaskParams) -> anyhow::Result<crate::config::TaskDef> {
-    use crate::config::{Sandbox, TaskDef};
+    use crate::config::{Sandbox, TaskDef, TaskKind};
 
     anyhow::ensure!(!p.cwd.trim().is_empty(), "cwd cannot be empty");
-    let sandbox = match p.sandbox.as_deref().unwrap_or("read-only") {
-        "read-only" => Sandbox::ReadOnly,
-        "read-write" => Sandbox::ReadWrite,
-        "network-read-only" => Sandbox::NetworkReadOnly,
-        other => {
+    let full_auto = p.full_auto.unwrap_or(true);
+    let kind = match p.kind.as_deref() {
+        Some("exec") | None => TaskKind::Exec,
+        Some("review") => TaskKind::Review,
+        Some(other) => anyhow::bail!("unknown kind '{}'; use exec or review", other),
+    };
+    let sandbox = match p.sandbox.as_deref() {
+        Some("read-only") => Sandbox::ReadOnly,
+        Some("read-write") | None => Sandbox::ReadWrite,
+        Some("danger-full-access") => Sandbox::DangerFullAccess,
+        Some(other) => {
             anyhow::bail!(
-                "unknown sandbox '{}'; use read-only, read-write, or network-read-only",
+                "unknown sandbox '{}'; use read-only, read-write, or danger-full-access",
                 other
             )
         }
     };
+    anyhow::ensure!(
+        !(full_auto && sandbox == Sandbox::ReadOnly),
+        "full_auto is incompatible with sandbox: read-only \
+         (--full-auto forces workspace-write). Set sandbox: read-write or full_auto: false"
+    );
+    let uncommitted = p.uncommitted.unwrap_or(false);
+    if kind != TaskKind::Review {
+        anyhow::ensure!(
+            !uncommitted && p.base.is_none() && p.commit.is_none() && p.review_title.is_none(),
+            "uncommitted/base/commit/review_title fields require kind: review"
+        );
+    }
     Ok(TaskDef {
         name: p.name,
         cwd: std::path::PathBuf::from(p.cwd),
         prompt: p.prompt,
+        kind,
         sandbox,
         agent_id: p.agent_id,
         thread_id: p.thread_id,
-        output_schema: None,
-        ephemeral: false,
-        add_dirs: vec![],
+        output_schema: p.output_schema.map(std::path::PathBuf::from),
+        ephemeral: p.ephemeral.unwrap_or(false),
+        add_dirs: p.add_dirs.into_iter().map(std::path::PathBuf::from).collect(),
         model: p.model,
         depends_on: p.depends_on,
-        ask_for_approval: p.ask_for_approval.unwrap_or_else(|| "never".to_string()),
+        full_auto,
         config_overrides: p.config_overrides,
         profile: p.profile,
+        uncommitted,
+        base: p.base,
+        commit: p.commit,
+        review_title: p.review_title,
+        images: p.images.into_iter().map(std::path::PathBuf::from).collect(),
+        enable_features: p.enable_features,
+        disable_features: p.disable_features,
+        ask_for_approval: None,
     })
 }
 
@@ -1272,48 +1341,49 @@ mod tests {
         assert_eq!(p1, p2);
     }
 
-    #[test]
-    fn params_to_task_def_rejects_empty_cwd() {
-        let err = params_to_task_def(DispatchTaskParams {
+    fn test_dispatch_params(name: &str, cwd: &str, prompt: &str) -> DispatchTaskParams {
+        DispatchTaskParams {
             run_dir: "/tmp/run".into(),
-            name: "task-a".into(),
-            cwd: "   ".into(),
-            prompt: "do work".into(),
+            name: name.into(),
+            cwd: cwd.into(),
+            prompt: prompt.into(),
+            kind: None,
             sandbox: None,
             model: None,
             depends_on: vec![],
             agent_id: None,
             thread_id: None,
-            ask_for_approval: None,
+            full_auto: None,
             config_overrides: vec![],
             profile: None,
-        })
-        .unwrap_err();
+            output_schema: None,
+            ephemeral: None,
+            add_dirs: vec![],
+            uncommitted: None,
+            base: None,
+            commit: None,
+            review_title: None,
+            images: vec![],
+            enable_features: vec![],
+            disable_features: vec![],
+        }
+    }
 
+    #[test]
+    fn params_to_task_def_rejects_empty_cwd() {
+        let p = test_dispatch_params("task-a", "   ", "do work");
+        let err = params_to_task_def(p).unwrap_err();
         assert!(err.to_string().contains("cwd cannot be empty"));
     }
 
     #[test]
     fn params_to_task_def_rejects_unknown_sandbox() {
-        let err = params_to_task_def(DispatchTaskParams {
-            run_dir: "/tmp/run".into(),
-            name: "task-a".into(),
-            cwd: ".".into(),
-            prompt: "do work".into(),
-            sandbox: Some("nope".into()),
-            model: None,
-            depends_on: vec![],
-            agent_id: None,
-            thread_id: None,
-            ask_for_approval: None,
-            config_overrides: vec![],
-            profile: None,
-        })
-        .unwrap_err();
-
+        let mut p = test_dispatch_params("task-a", ".", "do work");
+        p.sandbox = Some("nope".into());
+        let err = params_to_task_def(p).unwrap_err();
         assert!(err
             .to_string()
-            .contains("unknown sandbox 'nope'; use read-only, read-write, or network-read-only"));
+            .contains("unknown sandbox 'nope'; use read-only, read-write, or danger-full-access"));
     }
 
     #[test]

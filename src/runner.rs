@@ -148,34 +148,80 @@ impl TaskRunner {
 
         // Build command
         let mut cmd = Command::new(codex_bin());
-        cmd.args(["exec", "-C"]);
-        cmd.arg(&task.cwd);
-        cmd.args(["-s", &task.sandbox.to_string()]);
-        cmd.args([
-            "-o",
-            result_file
+        let is_review = task.kind == crate::config::TaskKind::Review;
+
+        cmd.arg("exec");
+        if is_review {
+            cmd.arg("review");
+            // `codex exec review` doesn't support -C; use current_dir instead.
+            // Canonicalize the output path first so -o resolves correctly even
+            // after current_dir changes the working directory.
+            cmd.current_dir(&task.cwd);
+        } else {
+            cmd.args(["-C"]);
+            cmd.arg(&task.cwd);
+        }
+
+        // For review tasks, canonicalize the output path so it resolves from the
+        // original run directory, not from task.cwd set via current_dir().
+        let result_path_str;
+        if is_review {
+            let abs_result = std::fs::canonicalize(self.output_dir.as_path())
+                .unwrap_or_else(|_| self.output_dir.clone())
+                .join(format!("{}.md", task.name));
+            result_path_str = abs_result
                 .to_str()
-                .ok_or_else(|| anyhow::anyhow!("output file path is not valid UTF-8"))?,
-        ]);
-        cmd.args(["--json", "--skip-git-repo-check"]);
+                .ok_or_else(|| anyhow::anyhow!("output file path is not valid UTF-8"))?
+                .to_string();
+        } else {
+            result_path_str = result_file
+                .to_str()
+                .ok_or_else(|| anyhow::anyhow!("output file path is not valid UTF-8"))?
+                .to_string();
+        }
+        cmd.args(["-o", &result_path_str]);
+        cmd.arg("--json");
+        if !is_review {
+            cmd.arg("--skip-git-repo-check");
+        }
+        if task.full_auto {
+            cmd.arg("--full-auto");
+            // --full-auto implies -s workspace-write and -a on-request.
+            // Only pass explicit -s if user wants a higher sandbox level.
+            if task.sandbox == crate::config::Sandbox::DangerFullAccess {
+                cmd.args(["-s", &task.sandbox.to_string()]);
+            }
+        } else {
+            cmd.args(["-s", &task.sandbox.to_string()]);
+        }
         if let Some(ref model) = task.model {
             cmd.args(["-m", model]);
         }
-        if let Some(ref output_schema) = task.output_schema {
-            cmd.arg("--output-schema");
-            cmd.arg(output_schema);
+        // exec-only flags (not available on review subcommand)
+        if !is_review {
+            if let Some(ref output_schema) = task.output_schema {
+                cmd.arg("--output-schema");
+                cmd.arg(output_schema);
+            }
+            for add_dir in &task.add_dirs {
+                cmd.arg("--add-dir");
+                cmd.arg(add_dir);
+            }
+            for image in &task.images {
+                cmd.arg("--image");
+                cmd.arg(image);
+            }
         }
         if task.ephemeral {
             cmd.arg("--ephemeral");
         }
-        for add_dir in &task.add_dirs {
-            cmd.arg("--add-dir");
-            cmd.arg(add_dir);
+        for feature in &task.enable_features {
+            cmd.arg("--enable");
+            cmd.arg(feature);
         }
-        // The codex CLI removed the `-a` flag; use `--full-auto` instead.
-        // --full-auto = auto-approve within sandbox (the -s flag above sets sandbox level).
-        if task.ask_for_approval == "never" || task.ask_for_approval == "auto-edit" {
-            cmd.arg("--full-auto");
+        for feature in &task.disable_features {
+            cmd.arg("--disable");
+            cmd.arg(feature);
         }
         for kv in &task.config_overrides {
             cmd.args(["-c", kv]);
@@ -183,7 +229,25 @@ impl TaskRunner {
         if let Some(ref profile) = task.profile {
             cmd.args(["-p", profile]);
         }
-        cmd.arg(&task.prompt);
+        // Review-specific flags
+        let has_review_scope = task.uncommitted || task.base.is_some() || task.commit.is_some();
+        if task.uncommitted {
+            cmd.arg("--uncommitted");
+        }
+        if let Some(ref base) = task.base {
+            cmd.args(["--base", base]);
+        }
+        if let Some(ref commit_sha) = task.commit {
+            cmd.args(["--commit", commit_sha]);
+        }
+        if let Some(ref title) = task.review_title {
+            cmd.args(["--title", title]);
+        }
+        // `codex exec review` conflicts [PROMPT] with --uncommitted/--base/--commit.
+        // When review scope flags are set, the prompt is omitted (Codex CLI limitation).
+        if !(is_review && has_review_scope) {
+            cmd.arg(&task.prompt);
+        }
         prepare_command(&mut cmd);
 
         let mut child = cmd.spawn().context("failed to spawn codex process")?;
