@@ -1,18 +1,30 @@
 # codex-par
 
-Run multiple [Codex](https://github.com/openai/codex) tasks in parallel, with dependency waves and a live dashboard. Also ships an MCP server so Claude can dispatch and monitor runs without blocking.
-
-## Architecture
-
-<p align="center">
-  <img src="docs/diagrams/01-system-overview.svg" alt="System Overview" width="100%"/>
-</p>
+Run multiple [Codex](https://github.com/openai/codex) tasks in parallel, with dependency waves and a live dashboard. `codex-par` exists because MCP-based agent execution was too serialized, too opaque, and too easy to deadlock. It also ships an MCP server so Claude can dispatch and monitor runs without blocking.
 
 ## Why
 
 When Claude calls Codex via MCP, all calls serialize — even across multiple team agents sharing one MCP server. A 3-task workload that could finish in 30 minutes takes 90 minutes. There's also a deadlock risk: Claude's MCP client is half-duplex synchronous, so if Codex tries to send a sub-request while Claude is waiting for the response, both sides hang.
 
 `codex-par` bypasses MCP entirely. Each task spawns an independent `codex exec --json` process, achieving true process-isolated parallelism with live progress monitoring.
+
+## Thesis
+
+- **Parallelism should be real, not simulated through one blocked MCP channel**
+- **Agent execution should be observable while it is happening, not only after it finishes**
+- **Cancellation and failure handling are first-class runtime concerns, not polish**
+
+## Proof Snapshot
+
+- **Problem**: a 3-task workload that should finish in ~30 minutes took ~90 minutes through serialized MCP execution
+- **Approach**: bypass MCP for execution, run one isolated `codex exec --json` process per task, and schedule by dependency waves
+- **Result**: true parallelism, live runtime visibility, and a safer cancellation model
+
+## Architecture
+
+<p align="center">
+  <img src="docs/diagrams/01-system-overview.svg" alt="System Overview" width="100%"/>
+</p>
 
 ## Install
 
@@ -60,6 +72,8 @@ codex-par run tasks.yaml --dashboard
 ```
 
 Wave 0 (`fee_calculator` + `retry_job`) run in parallel. Wave 1 (`cross_review`) starts only after both complete.
+
+This is the point of the tool: independent work should start immediately, and dependent work should wait only on what it actually needs.
 
 ## Commands
 
@@ -110,6 +124,8 @@ All subcommands accept `--dir / -d` to set the base directory for `outputs/` and
 | `review_title` | string | no | Title for the review summary (`kind: review` only) |
 
 Validation runs before any tasks start: duplicate names, unknown dependencies, cycles, and invalid characters are all rejected upfront.
+
+That up-front rejection matters because broken dependency graphs should fail before burning tokens.
 
 ## Dashboard
 
